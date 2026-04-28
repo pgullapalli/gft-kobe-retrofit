@@ -299,6 +299,45 @@ Root cause: the old view joined `EM_SHIP_POINT` to resolve ship point type; `GFT
 | Q4 | `SHIP_POINT_TYPE_CD` is NULL for ~908 delivery items. Can the source view be enriched to populate this for plant codes (LO/LU/DE/TR, SAP numeric codes, MIT codes, V-prefix codes)? Alternatively, should we reinstate a join to `EM_SHIP_POINT`? | T5 found 908 NULL SHIPPING_PT_TYPE rows. European hub codes (LO/LU/DE/TR) are most likely to affect shipment classification. V-prefix codes get correct DEPLOYMENT via separate rule but still show NULL SHIPPING_PT_TYPE. | HIGH | Open |
 | Q5 | Why does the FL chargeable weight use `FPP_FL_CHRGBLE_WEIGHT_MSR_KG_SUM` instead of `FPP_CHRGBLE_WEIGHT_MSR_KG` (used for SG and LH legs)? Is it already pre-aggregated? | Needed to confirm weight methodology is consistent across legs. | MEDIUM | Open |
 | Q7 | 6 products in `GFT_COSTED_EXTENDED_GFT2` are not yet classified in the OPH HMS hierarchy: `KU193ZD/A` (iPhone 15 Plus Pink 256GB), `BCSE3LL/A`, `BCXL3LL/A`, `BCSB3LL/A`, `BCS83LL/A`, `BCTY3LL/A` (iPad A16 bundles). Can these be added to the OPH custom group in HMS? Currently handled via LEFT JOIN with `PRDT_CUSTOM_GRP_GFT = NULL` for these products. | These products' freight data is included in the view but unclassified by product group. | MEDIUM | Open |
+| Q8 | Please confirm the new OPH product group join logic is equivalent to the old. See definitions below. | Ensures PRDT_CUSTOM_GRP_GFT values are consistent between view1 and view2. | HIGH | Open |
+
+#### Q8 Detail — OPH CTE: Old vs New
+
+**Old (view1 — MDM tables in GBI_FINANCE_BAP_DB):**
+```sql
+oph AS (
+    SELECT
+        omcgmec.prod_node_id,
+        UPPER(mcgc.custom_grp_desc) AS Prdt_Custom_Grp_GFT
+    FROM GBI_FINANCE_BAP_DB.FINANCE_BIZ.OPH_MDM_CUSTM_GRP_MPN_EXT_CUR omcgmec
+    JOIN GBI_FINANCE_BAP_DB.FINANCE_BIZ.MDM_CUSTOM_GROUP_CUR mcgc
+        ON  mcgc.GRP_CATEG_CD    = 'gft_All'
+        AND mcgc.custom_grp_cd   = omcgmec.custom_grp_cd
+        AND mcgc.hier_cd         = omcgmec.HIER_CD
+        AND LEFT(mcgc.custom_grp_desc, 3) = 'OPH'
+    WHERE omcgmec.HIER_CD = 'OPH'
+)
+```
+
+**New (view2 — HMS tables in GBI_FINANCE_SEMANTIC_DB):**
+```sql
+oph AS (
+    SELECT
+        pe.prod_node_id,
+        UPPER(def.CG_NAME) AS Prdt_Custom_Grp_GFT
+    FROM GBI_FINANCE_SEMANTIC_DB.SALESFIN_ENT.HMS_CG_PROD_EXPLOSION_CUR pe
+    LEFT JOIN GBI_FINANCE_SEMANTIC_DB.SALESFIN_ENT.HMS_CUSTOM_GROUP_DTLS_CUR dtls
+        ON  dtls.cg_code     = pe.cg_code
+        AND dtls.cg_scope_id = pe.cg_scope_id
+    LEFT JOIN GBI_FINANCE_SEMANTIC_DB.SALESFIN_ENT.HMS_CUSTOM_GROUP_DEF_CUR def
+        ON  def.cg_code      = pe.cg_code
+    WHERE dtls.cg_scope_type     = 'OPH'
+      AND def.CG_OWNER_FN_GROUP  = 'Ops Finance'
+      AND LEFT(def.CG_NAME, 3)   = 'OPH'
+)
+```
+
+*Key mapping: `GRP_CATEG_CD='gft_All'` → `CG_OWNER_FN_GROUP='Ops Finance'`; `HIER_CD='OPH'` → `cg_scope_type='OPH'`; `custom_grp_desc` → `CG_NAME`. LEFT JOIN used to retain 6 products not yet classified in HMS (see Q7).*
 
 ---
 
