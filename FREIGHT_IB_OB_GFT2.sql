@@ -3,7 +3,7 @@
 -- Replaces FREIGHT_OB_COSTED, built on GFT 2.0 model (GFT_COSTED_EXTENDED)
 --
 -- Key design notes:
---   1. Source: GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED (view2)
+--   1. Source: GBI_FINANCE_DATA_ENG_DB.FIN_DATA_ENG.GFT_COSTED_EXTENDED_GFT2 (view2)
 --      - grain is delivery_line_item + CHARGE_NAME (one row per charge per leg)
 --      - OLD model grain was delivery_line_item with per-leg columns pre-pivoted
 --
@@ -44,7 +44,7 @@
 --      columns in the source if a separate fuel cost is required.
 -- =============================================================================
 
-create or replace view GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_IB_OB_GFT2(
+create or replace view GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2(
     UNIVERSE,
     COSTED_FLAG,
     FISCAL_QTR_YEAR,
@@ -207,7 +207,7 @@ base AS (
         -- Retain ROLLING_QUARTER for WHERE filter pushdown (used in outer WHERE)
         MAX(g.ROLLING_QUARTER)                                                         AS Rolling_Quarter
 
-    FROM GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED g
+    FROM GBI_FINANCE_DATA_ENG_DB.FIN_DATA_ENG.GFT_COSTED_EXTENDED_GFT2 g
 
     WHERE g.COSTED_FLAG       = 'Y'
       AND g.DELIVERY_TYPE_CD NOT IN ('NL', 'NLCC', 'LR')
@@ -218,19 +218,25 @@ base AS (
 ),
 
 -- ---------------------------------------------------------------------------
--- STEP 2: OPH Product Custom Group (same MDM join as old view, using PROD_ID)
+-- STEP 2: OPH Product Custom Group (updated to HMS views, using PROD_ID)
+--         HMS_CUSTOM_GROUP_DEF_CUR     replaces MDM_CUSTOM_GROUP_CUR
+--         HMS_CG_PROD_EXPLOSION_CUR    replaces OPH_MDM_CUSTM_GRP_MPN_EXT_CUR
+--         HMS_CUSTOM_GROUP_DTLS_CUR    new intermediate scope layer; joined on
+--                                      cg_code + cg_scope_id
 -- ---------------------------------------------------------------------------
 oph AS (
     SELECT
-        omcgmec.prod_node_id,
-        UPPER(mcgc.custom_grp_desc) AS Prdt_Custom_Grp_GFT
-    FROM GBI_FINANCE_BAP_DB.FINANCE_BIZ.OPH_MDM_CUSTM_GRP_MPN_EXT_CUR omcgmec
-    JOIN GBI_FINANCE_BAP_DB.FINANCE_BIZ.MDM_CUSTOM_GROUP_CUR mcgc
-        ON  mcgc.GRP_CATEG_CD    = 'gft_All'
-        AND mcgc.custom_grp_cd   = omcgmec.custom_grp_cd
-        AND mcgc.hier_cd         = omcgmec.HIER_CD
-        AND LEFT(mcgc.custom_grp_desc, 3) = 'OPH'
-    WHERE omcgmec.HIER_CD = 'OPH'
+        pe.prod_node_id,
+        UPPER(def.CG_NAME)                                                  AS Prdt_Custom_Grp_GFT
+    FROM GBI_FINANCE_SEMANTIC_DB.SALESFIN_ENT.HMS_CG_PROD_EXPLOSION_CUR pe
+    LEFT JOIN GBI_FINANCE_SEMANTIC_DB.SALESFIN_ENT.HMS_CUSTOM_GROUP_DTLS_CUR dtls
+        ON  dtls.cg_code      = pe.cg_code
+        AND dtls.cg_scope_id  = pe.cg_scope_id
+    LEFT JOIN GBI_FINANCE_SEMANTIC_DB.SALESFIN_ENT.HMS_CUSTOM_GROUP_DEF_CUR def
+        ON  def.cg_code       = pe.cg_code
+    WHERE dtls.cg_scope_type          = 'OPH'
+      AND def.CG_OWNER_FN_GROUP       = 'Ops Finance'
+      AND LEFT(def.CG_NAME, 3)        = 'OPH'
 )
 
 -- ---------------------------------------------------------------------------
@@ -318,8 +324,8 @@ SELECT
 
 FROM base b
 
-JOIN oph ON oph.prod_node_id = b.Prod_Id
+LEFT JOIN oph ON oph.prod_node_id = b.Prod_Id
 
-WHERE oph.Prdt_Custom_Grp_GFT <> 'OPH_Software_Other'
+WHERE COALESCE(oph.Prdt_Custom_Grp_GFT, '') <> 'OPH_Software_Other'
 
 GROUP BY ALL;

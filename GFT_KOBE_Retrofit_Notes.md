@@ -1,8 +1,8 @@
 # GFT 2.0 KOBE Retrofit — Design, Data & Verification Notes
 
-**View:** `GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_IB_OB_GFT2`
+**View:** `GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2`
 **Replaces:** `GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_OB_COSTED`
-**Source Model:** `GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED` (GFT 2.0 / Pando)
+**Source Model:** `GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED` (GFT 2.0 / Pando)
 
 ---
 
@@ -46,7 +46,7 @@ The new view reconstructs per-leg columns from normalized rows using conditional
 
 | Property | Value |
 |---|---|
-| Full name | `GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED` |
+| Full name | `GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED` |
 | Grain | `DELIVERY_ID` + `DELIVERY_ITEM_NR` + `CHARGE_NAME` (per leg) |
 | Column count | ~664 columns |
 | Managed by | Pando team |
@@ -268,12 +268,37 @@ QBM7987731    10    SEG1      2     BASE FREIGHT   TCIF         BULK          1 
 
 | # | Gap | Impact | Status |
 |---|---|---|---|
-| 1 | `DIRECT+IDL/SFS → RETAIL STORE` override dropped | Some retail ship points may show as OEM instead of RETAIL STORE | Open — requires ESP.ORIGIN data or Pando enrichment |
+| 1 | `SHIP_POINT_TYPE_CD` not populated for ~908 delivery items (~0.8% of total) — causes `SHIPPING_PT_TYPE = NULL` | Affects shipment classification for those rows; see breakdown below | Open — raised with GFT team (Q4) |
 | 2 | `FUEL_SURCHARGE_COST_USD` always 0 | Column not comparable to view1; fuel embedded in BASE FREIGHT total | Open — investigate FUEL_RATE / FUEL_CHARGE_TYPE columns |
 | 3 | `ACCRUAL_COST_USD` NULL for some deliveries | COST_ACCRUAL_* columns zero until FPP processes; same behavior as view1 LEFT JOIN | Expected; not a defect |
 | 4 | `CARRIER_TYPE_FL` blank for some FL rows | Data gap in view2 source; FL leg carrier type not always populated | Open — raise with Pando team |
 | 5 | Is ACCRUAL_COST_USD inclusive of fuel? | Affects COST_ACCRUAL_TOTAL_USD comparability to view1 | Open — confirm with Pando team |
 | 6 | Multi-LH deliveries (LH2, LH3) | LH cost/weight rolls up correctly; SCAC/carrier uses LH1 only | Accepted; matches view1 concept |
+
+### Gap 1 Detail — NULL SHIPPING_PT_TYPE Breakdown (T5 finding, 108 distinct shipping points)
+
+| Pattern | Examples | Likely Type | Note |
+|---|---|---|---|
+| V-prefix | V384, V235, V332, V304, V192 | DS (Direct Ship) | DEPLOYMENT correctly gets 'DS' via `LEFT(SHIPPING_POINT_CD,1)='V'` rule; only SHIPPING_PT_TYPE is NULL |
+| European hub/DC codes | LO22, LU30, LU10, LU20, LU40, LU50, LU60, DE01, TR10 | HUB | Should likely be 'HUB' → DEPLOYMENT='FD'; SHIP_POINT_TYPE_CD not populated in source |
+| SAP numeric plant codes | 8402, 8401, 8206, 6401 | Unknown | Likely OEM/factory origins; need GFT team confirmation |
+| MIT / facility codes | MIT7, MIT5, MIT6, MIT3 | Unknown | Need GFT team confirmation |
+| Other alphanumeric | 332A, 336A, 166A, C73A, C73B | Unknown | Need GFT team confirmation |
+
+Root cause: the old view joined `EM_SHIP_POINT` to resolve ship point type; `GFT_COSTED_EXTENDED` does not populate `SHIP_POINT_TYPE_CD` for these plant codes. Options: (a) GFT/Pando team enriches `SHIP_POINT_TYPE_CD` in the source, or (b) reinstate a join to `EM_SHIP_POINT`.
+
+---
+
+## Questions for GFT Team
+
+| # | Question | Context | Priority | Status |
+|---|---|---|---|---|
+| Q1 | ~~Is `CHARGE_NAME` always `'BASE FREIGHT'`, or could other charge types appear?~~ | Confirmed via T1: only BASE FREIGHT exists. No action needed. | ~~CRITICAL~~ | Closed |
+| Q2 | ~~Do LH2/LH3 ever have a different `PARENT_SCAC_CD` than LH1?~~ | Confirmed via T2: no results — SCAC is consistent across all LH legs. | ~~HIGH~~ | Closed |
+| Q3 | ~~Is `ACCRUAL_WEIGHT_KG` guaranteed to be identical across all charge rows for a given delivery item?~~ | Confirmed via T3: no results — weight is consistent. MAX() is safe. | ~~HIGH~~ | Closed |
+| Q4 | `SHIP_POINT_TYPE_CD` is NULL for ~908 delivery items. Can the source view be enriched to populate this for plant codes (LO/LU/DE/TR, SAP numeric codes, MIT codes, V-prefix codes)? Alternatively, should we reinstate a join to `EM_SHIP_POINT`? | T5 found 908 NULL SHIPPING_PT_TYPE rows. European hub codes (LO/LU/DE/TR) are most likely to affect shipment classification. V-prefix codes get correct DEPLOYMENT via separate rule but still show NULL SHIPPING_PT_TYPE. | HIGH | Open |
+| Q5 | Why does the FL chargeable weight use `FPP_FL_CHRGBLE_WEIGHT_MSR_KG_SUM` instead of `FPP_CHRGBLE_WEIGHT_MSR_KG` (used for SG and LH legs)? Is it already pre-aggregated? | Needed to confirm weight methodology is consistent across legs. | MEDIUM | Open |
+| Q7 | 6 products in `GFT_COSTED_EXTENDED_GFT2` are not yet classified in the OPH HMS hierarchy: `KU193ZD/A` (iPhone 15 Plus Pink 256GB), `BCSE3LL/A`, `BCXL3LL/A`, `BCSB3LL/A`, `BCS83LL/A`, `BCTY3LL/A` (iPad A16 bundles). Can these be added to the OPH custom group in HMS? Currently handled via LEFT JOIN with `PRDT_CUSTOM_GRP_GFT = NULL` for these products. | These products' freight data is included in the view but unclassified by product group. | MEDIUM | Open |
 
 ---
 
@@ -294,7 +319,7 @@ QBM7987731    10    SEG1      2     BASE FREIGHT   TCIF         BULK          1 
 ### Check LEG_TYPE values
 ```sql
 SELECT DISTINCT LEG_TYPE
-FROM GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
 WHERE DATA_CLASS_CD = 'OB'
   AND ROLLING_QUARTER IN (-1, 0)
 ORDER BY 1;
@@ -303,7 +328,7 @@ ORDER BY 1;
 ### Check CHARGE_NAME values
 ```sql
 SELECT CHARGE_NAME, CHARGE_CATEGORY, COUNT(*) AS CNT
-FROM GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
 WHERE DATA_CLASS_CD = 'OB'
   AND ROLLING_QUARTER IN (-1, 0)
 GROUP BY 1, 2
@@ -319,7 +344,7 @@ SELECT
     GFT_CHARGEABLE_WT_KG, FPP_CHRGBLE_WEIGHT_MSR_KG,
     FPP_FL_CHRGBLE_WEIGHT_MSR_KG_SUM, ACCRUAL_WEIGHT_KG,
     FUEL_RATE, FUEL_CHARGE_TYPE, REPORTING_FLAG
-FROM GBI_OPS_SEMANTIC_DB.GFT_PANDO.GFT_COSTED_EXTENDED
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
 WHERE DELIVERY_ID = '<DELIVERY_ID>'
   AND DELIVERY_ITEM_NR = <ITEM_NR>
 ORDER BY LEG_TYPE;
@@ -331,7 +356,7 @@ ORDER BY LEG_TYPE;
 SELECT COUNT(*) FROM GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_OB_COSTED;
 
 -- View2 new
-SELECT COUNT(*) FROM GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_IB_OB_GFT2;
+SELECT COUNT(*) FROM GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2;
 ```
 
 ### Aggregate comparison by fiscal quarter
@@ -343,8 +368,100 @@ SELECT
     SUM(v.COST_ACCRUAL_TOTAL_USD)  AS ACCRUAL_v1,
     SUM(n.COST_ACCRUAL_TOTAL_USD)  AS ACCRUAL_v2
 FROM GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_OB_COSTED   v
-FULL OUTER JOIN GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_IB_OB_GFT2 n
+FULL OUTER JOIN GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2 n
     ON v.FISCAL_QTR_YEAR = n.FISCAL_QTR_YEAR
 GROUP BY 1
 ORDER BY 1;
+```
+
+---
+
+## Logic Validation Queries
+
+### T1 — Confirm only BASE FREIGHT exists
+```sql
+SELECT CHARGE_NAME, COUNT(*) cnt
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
+WHERE COSTED_FLAG = 'Y'
+  AND DELIVERY_TYPE_CD NOT IN ('NL', 'NLCC', 'LR')
+  AND DATA_CLASS_CD = 'OB'
+  AND ROLLING_QUARTER IN (-5,-4,-3,-2,-1,0)
+GROUP BY 1
+ORDER BY 2 DESC;
+```
+
+### T2 — Check if LH2/LH3 ever have different SCACs than LH1
+```sql
+SELECT DELIVERY_ID, DELIVERY_ITEM_NR,
+       LISTAGG(DISTINCT LEG_TYPE || ':' || PARENT_SCAC_CD, '; ')
+         WITHIN GROUP (ORDER BY LEG_TYPE) AS legs_scacs
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
+WHERE LEG_TYPE IN ('LH1','LH2','LH3')
+  AND COSTED_FLAG = 'Y'
+  AND DATA_CLASS_CD = 'OB'
+GROUP BY 1, 2
+HAVING COUNT(DISTINCT PARENT_SCAC_CD) > 1
+LIMIT 100;
+```
+
+### T3 — Confirm ACCRUAL_WEIGHT_KG is same across all rows per delivery item
+```sql
+SELECT DELIVERY_ID, DELIVERY_ITEM_NR,
+       COUNT(DISTINCT ACCRUAL_WEIGHT_KG) AS weight_variants
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
+WHERE COSTED_FLAG = 'Y'
+  AND DATA_CLASS_CD = 'OB'
+GROUP BY 1, 2
+HAVING COUNT(DISTINCT ACCRUAL_WEIGHT_KG) > 1
+LIMIT 100;
+```
+
+### T4 — Product match rate (quantifies INNER JOIN drop-off)
+```sql
+SELECT 'In GFT source' AS label, COUNT(DISTINCT PROD_ID) AS cnt
+FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
+WHERE COSTED_FLAG = 'Y'
+  AND DELIVERY_TYPE_CD NOT IN ('NL','NLCC','LR')
+  AND DATA_CLASS_CD = 'OB'
+UNION ALL
+SELECT 'Matched to OPH', COUNT(DISTINCT bp.PROD_ID)
+FROM (
+    SELECT DISTINCT PROD_ID
+    FROM GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED
+    WHERE COSTED_FLAG = 'Y'
+      AND DELIVERY_TYPE_CD NOT IN ('NL','NLCC','LR')
+      AND DATA_CLASS_CD = 'OB'
+) bp
+JOIN GBI_FINANCE_BAP_DB.FINANCE_BIZ.OPH_MDM_CUSTM_GRP_MPN_EXT_CUR omcgmec
+  ON omcgmec.prod_node_id = bp.PROD_ID
+WHERE omcgmec.HIER_CD = 'OPH';
+```
+
+### T5 — NULL audit on key dimensions
+```sql
+SELECT
+    SUM(CASE WHEN Shipping_Pt_Type IS NULL THEN 1 ELSE 0 END) AS null_shipping_pt_type,
+    SUM(CASE WHEN Shipment_Mode IS NULL THEN 1 ELSE 0 END) AS null_shipment_mode,
+    SUM(CASE WHEN RTM_1 IS NULL THEN 1 ELSE 0 END) AS null_rtm_1,
+    COUNT(*) AS total_rows
+FROM GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2;
+```
+
+### T6 — Verify SG + LH + FL = Total cost
+```sql
+SELECT COUNT(*) AS mismatches
+FROM GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2
+WHERE ABS(
+    (COST_ACCRUAL_SG_USD + COST_ACCRUAL_LH_USD + COST_ACCRUAL_FL_USD)
+    - COST_ACCRUAL_TOTAL_USD
+) > 0.01;
+```
+
+### T7 — Cardinality check (one row per delivery item)
+```sql
+SELECT DELIVERY_ID, DELIVERY_ITEM_NR, COUNT(*) AS row_count
+FROM GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2
+GROUP BY 1, 2
+HAVING COUNT(*) > 1
+LIMIT 100;
 ```
