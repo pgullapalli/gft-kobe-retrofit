@@ -1,8 +1,10 @@
 # GFT 2.0 KOBE Retrofit — Design, Data & Verification Notes
 
 **View:** `GBI_FINANCE_BAP_DB.FINANCE_PREP_BIZ.FREIGHT_IB_OB_GFT2`
-**Replaces:** `GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_OB_COSTED`
+**Replaces:** `GBI_FINANCE_BAP_DB.FINANCE_BIZ.FREIGHT_IB_OB` (full wrapper — original scope was only the `FREIGHT_OB_COSTED` inner layer; expanded to Option B full replacement)
 **Source Model:** `GBI_OPS_SEMANTIC_DB.GFT.GFT_COSTED_EXTENDED` (GFT 2.0 / Pando)
+**Status:** Deployed — view successfully created 2026-05-05
+**Column count:** 54 (43 original FREIGHT_OB_COSTED columns + 11 added to match full FREIGHT_IB_OB scope)
 
 ---
 
@@ -18,7 +20,9 @@ The challenge: the two models have **incompatible grain**.
 | Per-leg columns | Pre-computed `Seg1_*`, `Line_Haul_*`, `Final_Leg_*` | Normalized rows keyed by `LEG_TYPE` |
 | Source system | GFT 1.0 legacy tables | Pando / GFT_COSTED_EXTENDED |
 
-The new view reconstructs per-leg columns from normalized rows using conditional aggregation (pivot), preserving the exact 43-column output schema of view1 for downstream compatibility.
+The new view reconstructs per-leg columns from normalized rows using conditional aggregation (pivot).
+
+**Scope expansion (Option B):** The original design targeted only the `FREIGHT_OB_COSTED` inner layer (43 columns). The actual target is the full `FREIGHT_IB_OB` wrapper — 54 columns — which adds Dataiku-sourced enrichment columns, derived dimensions (CHANNEL, STO_TYPE, RATE_TYPE), proxy expansion UNION ALL, and deployment-mix logic. The 11 columns added beyond the FREIGHT_OB_COSTED schema are: `RATE_TYPE`, `CHANNEL`, `STO_TYPE`, `ORIGINAL_DATASET`, `SCAC_SG_FLAG`, `PROGRAM_CODE`, `COUNTRY_FCST`, `DC_FCST`, `ORIGIN`, `BULK_PARCEL`, `DEPLOYMENT_MIX`, `RETAIL_BOPIS_UNITS`, `PROXY_IB_LISTING_FLAG`.
 
 ---
 
@@ -59,6 +63,7 @@ The new view reconstructs per-leg columns from normalized rows using conditional
 |---|---|---|
 | `DATA_CLASS_CD` | UNIVERSE | 'OB' or 'IB' |
 | `COSTED_FLAG` | COSTED_FLAG | Filter: = 'Y' |
+| `RATE_TYPE` | RATE_TYPE | MAX() in base CTE; direct column from source |
 | `FISCAL_QTR_YEAR` | FISCAL_QTR_YEAR | Pre-computed in view2 |
 | `FISCAL_YEAR` + `FISCAL_QUARTER` | FISCAL_QUARTER | Concatenated with TRIM() |
 | `PO_TYPE_CD` | PO_TYPE_CD | Available in view2 (was NULL in view1) |
@@ -88,22 +93,62 @@ The new view reconstructs per-leg columns from normalized rows using conditional
 
 ---
 
+## Dataiku Reference Tables
+
+Four Dataiku-managed lookup tables are LEFT JOINed in the final SELECT. All live in `GBI_FINANCE_BAP_DB.FINANCE_BIZ_APP`.
+
+| Table | Join Key | Columns Used | Purpose |
+|---|---|---|---|
+| `DKU_OFN_LF_CARRIER_MAPPING` | `CARRIER = b.SCAC_SG` | — (existence check) | Sets SCAC_SG_FLAG = 1 if SCAC_SG is a known carrier |
+| `DKU_OFN_LF_PRODUCTS_MAPPING` | `PRODUCT_CUSTOM_GROUP = oph.Prdt_Custom_Grp_GFT` | `PROGRAM_CODE` | Enriches product rows with program code |
+| `DKU_OFN_LF_COUNTRY_DC_FCST_MAPPING` | `ISO_CD = b.Dest_Country_Cd` | `DC_FCST`, `COUNTRY_FCST` | Maps destination country to DC and logistics region forecast labels |
+| `DKU_OFN_LF_ORIGIN_FCST_MAPPING` | `SOURCE_CITY = b.Source_City` AND `SHIPPING_PT_TYPE` | `ORIGIN_FCST` | Maps origin city + ship-point type to origin forecast label |
+
+Proxy expansion uses a fifth table (INNER JOIN, see Proxy Expansion section):
+
+| Table | Join Key | Columns Used | Purpose |
+|---|---|---|---|
+| `DKU_OFN_LF_PROXY_MAPPING` | `FROM_COUNTRY_CODE = b.Dest_Country_Cd` | `TO_COUNTRY_CODE`, `TO_LOGISTIC_REGION` | Expands international FD bulk rows with proxy destination country |
+
+---
+
+## Proxy Expansion (UNION ALL Branch)
+
+The final SELECT is a UNION ALL of two branches:
+
+**Branch 1 (main):** Standard rows. `PROXY_IB_LISTING_FLAG = 0`. No filter on DEPLOYMENT_MIX.
+
+**Branch 2 (proxy):** Duplicates rows where `DEPLOYMENT_MIX LIKE 'INTERNATIONAL_FD_BULK%'` with overridden destination country. `PROXY_IB_LISTING_FLAG = 1`. This branch uses:
+- `INNER JOIN DKU_OFN_LF_PROXY_MAPPING F ON b.Dest_Country_Cd = F.FROM_COUNTRY_CODE`
+- `F.TO_COUNTRY_CODE` replaces `b.Dest_Country_Cd` as `DEST_COUNTRY_CD`
+- `F.TO_LOGISTIC_REGION` replaces `cdm.COUNTRY_FCST` as `COUNTRY_FCST`
+- `SHIPMENT_MODE` is computed on the **original** `b.Dest_Country_Cd` (not the proxy-overridden country) — matching behavior of legacy materialized table
+
+The proxy expansion enables downstream allocation of international FD bulk freight cost to proxy destination countries in reporting.
+
+---
+
 ## View Design
 
 ### Two-Step CTE Pattern
 
 ```
-GFT_COSTED_EXTENDED          oph CTE
-(charge-level rows)      (MDM product group)
-       |                        |
-    base CTE                    |
-(pivot to delivery-item         |
- grain via conditional          |
- aggregation)                   |
+GFT_COSTED_EXTENDED          oph CTE        Dataiku tables (DKU_OFN_LF_*)
+(charge-level rows)      (MDM product group)  CARRIER_MAPPING
+       |                        |             PRODUCTS_MAPPING
+    base CTE                    |             COUNTRY_DC_FCST_MAPPING
+(pivot to delivery-item         |             ORIGIN_FCST_MAPPING
+ grain via conditional          |                    |
+ aggregation)                   |____________________|
        |________________________|
               |
-         final SELECT
+         final SELECT (PROXY_IB_LISTING_FLAG = 0)
     (derived dims + GROUP BY ALL)
+              |
+         UNION ALL
+              |
+    proxy SELECT (INNER JOIN DKU_OFN_LF_PROXY_MAPPING)
+    (DEPLOYMENT_MIX LIKE 'INTERNATIONAL_FD_BULK%', PROXY_IB_LISTING_FLAG = 1)
 ```
 
 **Step 1 — `base` CTE**: Collapses the normalized charge-level rows to one row per `DELIVERY_ID + DELIVERY_ITEM_NR + PROD_ID`. Uses:
@@ -147,7 +192,9 @@ END
 - EURO: IE source → `LOCAL` (checked first, before FD)
 - Default → `AIR`
 
-**RTM_1**:
+**RTM_1 / CHANNEL**:
+
+Column renamed from `RTM_1` (FREIGHT_OB_COSTED) to `CHANNEL` (FREIGHT_IB_OB / GFT2) — same mapping logic:
 ```
 ONLINE:ONLINE               → ONLINE
 RETAIL:RETAIL               → RETAIL
@@ -157,6 +204,71 @@ RSLR:RESELLER               → RESELLER
 EDU:EDUCATION               → EDUCATION
 (other)                     → NULL
 ```
+
+**RATE_TYPE**: `MAX(g.RATE_TYPE)` in base CTE — sourced directly from `GFT_COSTED_EXTENDED`. No derivation needed.
+
+**STO_TYPE**:
+```sql
+CASE
+    WHEN Shipping_Pt_Type = 'HUB' AND Universe = 'IB' THEN 'STO'
+    ELSE 'NON-STO'
+END
+```
+*Source: FREIGHT_IB_OB Column mapping spreadsheet (Slack Files).*
+
+**ORIGINAL_DATASET**: Hardcoded `'GFT2'`. To be updated if/when source changes.
+
+**SCAC_SG_FLAG**: `CASE WHEN cm.CARRIER IS NOT NULL THEN 1 ELSE 0 END` where `cm` is the LEFT JOIN to `DKU_OFN_LF_CARRIER_MAPPING`.
+
+**ORIGIN**:
+```sql
+CASE
+    WHEN om.ORIGIN_FCST IS NULL
+         AND b.Shipping_Pt_Type IN ('RETAIL STORE', 'HUB', 'HUB-RETURN') THEN 'DC_OUTBOUND'
+    ELSE om.ORIGIN_FCST
+END
+```
+*`om` is the LEFT JOIN to `DKU_OFN_LF_ORIGIN_FCST_MAPPING` on `SOURCE_CITY` + `SHIPPING_PT_TYPE`.*
+
+**BULK_PARCEL**:
+```sql
+CASE b.Dest_Region_Cd
+    WHEN 'AMR' THEN
+        CASE b.Carrier_Type_FL
+            WHEN 'PARCEL' THEN 'PARCEL'
+            WHEN 'POSTAL' THEN 'PARCEL'
+            ELSE 'BULK'
+        END
+    ELSE
+        CASE Channel
+            WHEN 'RESELLER' THEN 'BULK'
+            WHEN 'RETAIL'   THEN 'BULK'
+            WHEN 'ONLINE'   THEN 'PARCEL'
+            ELSE 'BULK'
+        END
+END
+```
+*Note: references the `Channel` alias from the same SELECT clause — valid in Snowflake.*
+
+**DEPLOYMENT_MIX**:
+```sql
+CAST(CASE b.Costed_Flag WHEN 'Y' THEN
+    CASE
+        WHEN Origin = 'DC_OUTBOUND'                         THEN 'OUTBOUND_' || Bulk_Parcel || '_' || Channel
+        WHEN Shipment_Mode = 'LOCAL'                        THEN Shipment_Mode || '_' || b.Deployment || '_' || Bulk_Parcel || '_' || Channel
+        WHEN b.Source_Country_Cd <> b.Dest_Country_Cd      THEN 'INTERNATIONAL_' || b.Deployment || '_' || Bulk_Parcel || '_' || Channel
+        WHEN b.Source_Country_Cd = b.Dest_Country_Cd       THEN 'LOCAL_' || b.Deployment || '_' || Bulk_Parcel || '_' || Channel
+    END
+ELSE CAST(NULL AS VARCHAR(20)) END AS VARCHAR(255))
+```
+*References `Origin`, `Bulk_Parcel`, `Channel`, `Shipment_Mode` aliases — all valid Snowflake forward-references within the same SELECT.*
+
+**RETAIL_BOPIS_UNITS**:
+```sql
+COALESCE(SUM(CASE WHEN b.Bopis_Item_Categ_Cd NOT IN ('$NA') AND b.Shipping_Pt_Type = 'RETAIL STORE' THEN b.Delivery_Unit ELSE 0 END), 0)
+```
+
+**PROXY_IB_LISTING_FLAG**: `0` in the main branch; `1` in the proxy UNION ALL branch.
 
 ---
 
@@ -180,7 +292,8 @@ EDU:EDUCATION               → EDUCATION
 | DEPLOYMENT | CASE on `ESP.SHIP_POINT_TYPE` | CASE on `SHIP_POINT_TYPE_CD` | |
 | SHIPMENT_MODE | CASE on region/deployment/country | Same logic, same columns | |
 | RTM_OPS_CHANNEL_L2 | `UPPER(CC.ops_channel_level_2_desc)` | `UPPER(OPS_CHANNEL_LEVEL_2_DESCRIPTION)` | No CHANNEL_CUR join needed |
-| RTM_1 | CASE on RTM_Ops_Channel_L2 | Same CASE logic | |
+| CHANNEL *(was RTM_1)* | CASE on RTM_Ops_Channel_L2 | Same CASE logic | Renamed from RTM_1 in FREIGHT_IB_OB |
+| RATE_TYPE | *(not in FREIGHT_OB_COSTED)* | `MAX(RATE_TYPE)` in base CTE | Added in Option B scope |
 | SCAC_SG | `DLIA.Seg1_SCAC_Cd` | `MAX(CASE WHEN LEG_TYPE='SEG1' THEN PARENT_SCAC_CD END)` | Pivot |
 | SCAC_LH | `DLIA.Line_haul_scac_Cd` | `MAX(CASE WHEN LEG_TYPE='LH1' THEN PARENT_SCAC_CD END)` | LH1 only |
 | SCAC_FL | `DLIA.final_leg_scac_Cd` | `MAX(CASE WHEN LEG_TYPE='FL' THEN PARENT_SCAC_CD END)` | Pivot |
@@ -206,6 +319,17 @@ EDU:EDUCATION               → EDUCATION
 | GFT_LH_COST_CHARGEABLE_USD | `SUM(DLICC.Line_Haul_std_cost_USD)` | `SUM(CASE WHEN LEG_TYPE IN ('LH1','LH2','LH3') THEN CHARGE_VALUE_USD END)` | |
 | GFT_FL_COST_CHARGEABLE_USD | `SUM(DLICC.final_leg_std_cost_actual_USD)` | `SUM(CASE WHEN LEG_TYPE='FL' THEN CHARGE_VALUE_USD END)` | |
 | FUEL_SURCHARGE_COST_USD | `SUM(DLICC.Fuel_Surcharge_Cost_USD)` | `CAST(0 AS NUMBER(38,6))` | No separate charge row in GFT 2.0 |
+| STO_TYPE | *(not in FREIGHT_OB_COSTED)* | CASE on Shipping_Pt_Type + Universe | Added in Option B scope |
+| ORIGINAL_DATASET | *(not in FREIGHT_OB_COSTED)* | `'GFT2'` hardcoded | Added in Option B scope |
+| SCAC_SG_FLAG | *(not in FREIGHT_OB_COSTED)* | 1 if SCAC_SG in DKU_OFN_LF_CARRIER_MAPPING | Added in Option B scope |
+| PROGRAM_CODE | *(not in FREIGHT_OB_COSTED)* | `pm.PROGRAM_CODE` from DKU_OFN_LF_PRODUCTS_MAPPING | Added in Option B scope |
+| COUNTRY_FCST | *(not in FREIGHT_OB_COSTED)* | `cdm.COUNTRY_FCST` from DKU_OFN_LF_COUNTRY_DC_FCST_MAPPING | Added in Option B scope; overridden in proxy branch |
+| DC_FCST | *(not in FREIGHT_OB_COSTED)* | `cdm.DC_FCST` from DKU_OFN_LF_COUNTRY_DC_FCST_MAPPING | Added in Option B scope |
+| ORIGIN | *(not in FREIGHT_OB_COSTED)* | CASE on ORIGIN_FCST mapping + Shipping_Pt_Type | Added in Option B scope |
+| BULK_PARCEL | *(not in FREIGHT_OB_COSTED)* | CASE on Dest_Region_Cd / Carrier_Type_FL / Channel | Added in Option B scope |
+| DEPLOYMENT_MIX | *(not in FREIGHT_OB_COSTED)* | Concat of Origin / Deployment / Bulk_Parcel / Channel | Added in Option B scope |
+| RETAIL_BOPIS_UNITS | *(not in FREIGHT_OB_COSTED)* | SUM CASE on BOPIS_ITEM_CATEG_CD + RETAIL STORE rows | Added in Option B scope |
+| PROXY_IB_LISTING_FLAG | *(not in FREIGHT_OB_COSTED)* | 0 (main branch) / 1 (proxy UNION ALL branch) | Added in Option B scope |
 
 ---
 
@@ -250,6 +374,7 @@ QBM7987731    10    SEG1      2     BASE FREIGHT   TCIF         BULK          1 
 
 | Decision | Chosen Approach | Rationale |
 |---|---|---|
+| **Full scope (Option B)** | Replace full FREIGHT_IB_OB wrapper, not just inner FREIGHT_OB_COSTED layer | FREIGHT_IB_OB_GFT2 is the downstream-facing view; partial replacement would leave Dataiku columns and proxy logic missing |
 | Grain pivot strategy | Conditional aggregation (`MAX`/`SUM` with CASE on LEG_TYPE) | Standard Snowflake pattern; no PIVOT keyword needed; readable |
 | SCAC_LH carrier identity | LH1 only | Matches view1 `Line_haul_scac_Cd` which used the primary leg |
 | LH cost/weight rollup | `IN ('LH1','LH2','LH3')` | Sum all line-haul legs for accurate total; individual legs may be partial |
@@ -261,6 +386,13 @@ QBM7987731    10    SEG1      2     BASE FREIGHT   TCIF         BULK          1 
 | OPH product group | MDM join retained (not from view2) | `PRDT_CUSTOM_GRP_GFT` not available in GFT_COSTED_EXTENDED |
 | Fiscal calendar | Use view2's built-in `FISCAL_QTR_YEAR` / `FISCAL_YEAR` / `FISCAL_QUARTER` | view2 already joins FISCAL_DAY_CUR with Region_Cd='AMR' |
 | PO_TYPE_CD | Populated from `PO_TYPE_CD` column | Was `CAST(NULL AS VARCHAR(20))` in view1; now available in GFT 2.0 |
+| RATE_TYPE | `MAX(g.RATE_TYPE)` in base CTE | Column exists directly in GFT_COSTED_EXTENDED; no derivation needed |
+| CHANNEL | Same CASE logic as RTM_1; column renamed to match FREIGHT_IB_OB schema | RTM_1 was the old internal name; CHANNEL is the published column name |
+| STO_TYPE | Derived: `CASE WHEN Shipping_Pt_Type='HUB' AND Universe='IB' THEN 'STO' ELSE 'NON-STO' END` | Not available in source; logic from FREIGHT_IB_OB column mapping spreadsheet |
+| ORIGINAL_DATASET | Hardcoded `'GFT2'` | Identifies source data model for downstream consumers; update if source changes |
+| Dataiku enrichment joins | 4 LEFT JOINs to `DKU_OFN_LF_*` tables | Matches pattern of legacy FREIGHT_IB_OB Dataiku-sourced columns; LEFT JOIN to avoid dropping rows with no mapping |
+| Proxy expansion | UNION ALL with INNER JOIN to `DKU_OFN_LF_PROXY_MAPPING` | Replicates legacy proxy expansion pattern; INNER JOIN intentional — only rows with a proxy mapping appear in proxy branch |
+| SHIPMENT_MODE in proxy branch | Computed on original `b.Dest_Country_Cd`, not proxy country | Matches behavior of legacy materialized table; proxy override only affects DEST_COUNTRY_CD and COUNTRY_FCST |
 
 ---
 
@@ -274,6 +406,7 @@ QBM7987731    10    SEG1      2     BASE FREIGHT   TCIF         BULK          1 
 | 4 | `CARRIER_TYPE_FL` blank for some FL rows | Data gap in view2 source; FL leg carrier type not always populated | Open — raise with Pando team |
 | 5 | Is ACCRUAL_COST_USD inclusive of fuel? | Affects COST_ACCRUAL_TOTAL_USD comparability to view1 | Open — confirm with Pando team |
 | 6 | Multi-LH deliveries (LH2, LH3) | LH cost/weight rolls up correctly; SCAC/carrier uses LH1 only | Accepted; matches view1 concept |
+| 7 | `GFT_COSTED_EXTENDED_GFT2` column count mismatch (659 declared vs 658 produced) | Blocked creation of `FREIGHT_IB_OB_GFT2` | **Resolved 2026-05-05** — Root cause: one column removed from live `GFT_COSTED_EXTENDED` after the GFT2 view was created. Fixed by recreating `GFT_COSTED_EXTENDED_GFT2` as `SELECT * FROM ... GFT_COSTED_EXTENDED` without explicit column header (Option 1). **Note: if Pando adds/removes columns from GFT_COSTED_EXTENDED in future, GFT_COSTED_EXTENDED_GFT2 must be recreated the same way to stay in sync.** |
 
 ### Gap 1 Detail — NULL SHIPPING_PT_TYPE Breakdown (T5 finding, 108 distinct shipping points)
 
@@ -345,11 +478,12 @@ oph AS (
 
 | File | Description |
 |---|---|
-| `FREIGHT_IB_OB_GFT2.sql` | New view DDL (production-ready) |
-| `FREIGHT_OB_COSTED.sql` | Old view DDL (reference / baseline) |
+| `FREIGHT_IB_OB_GFT2.sql` | New view DDL — 54 columns, full FREIGHT_IB_OB replacement (Option B). Deployed 2026-05-05. |
+| `FREIGHT_OB_COSTED.sql` | Old view DDL (reference / baseline, 43 columns) |
 | `GFT_COSTED_EXTENDED.sql` | Source view DDL from Pando team (~664 columns) |
 | `GFT 2.0 CDF column mappings.xlsx` | Column mapping spreadsheet (515 rows, GFT_PANDO team) |
 | `GFT_COSTED_EXTENDED_ANALYSIS.xlsx` | Spot-check data, sample queries, reference values |
+| `FREIGHT_IB_OB Column mapping Final.xlsx` | 55-row mapping table (Slack Files) — reference for RATE_TYPE, CHANNEL, STO_TYPE derivation logic |
 
 ---
 
